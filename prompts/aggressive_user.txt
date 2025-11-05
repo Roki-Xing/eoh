@@ -1,0 +1,3 @@
+Design an aggressive daily trading strategy for {symbol} that actively seeks high returns.
+Use indicators like fast/slow SMAs, RSI momentum filters, or other combinations to enter trends early.
+Express the logic in class `Strat(Strategy)` and return ONLY a Python code block.

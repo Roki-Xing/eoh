@@ -1,6 +1,8 @@
 
-import os, re, io, json, time, math, textwrap, argparse, random
+import os, io, json, textwrap, argparse, random
+from pathlib import Path
 from typing import Optional, Callable, List, Dict, Any, Tuple
+
 import numpy as np
 import pandas as pd
 import requests
@@ -18,6 +20,10 @@ from backtesting import Backtest, Strategy
 # HF Transformers
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
+
+from eoh_core.prompts import PromptLibrary, PromptStyle
+from eoh_core.llm import LocalHFClient, extract_code_blocks
+from eoh_core.utils import ensure_dir, log
 
 # -------------------------
 # args
@@ -38,10 +44,17 @@ def get_args():
     ap.add_argument("--max_new_tokens", type=int, default=320)
     ap.add_argument("--temperature", type=float, default=0.7)
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument(
+        "--prompt-style",
+        default="normal",
+        help="Comma separated prompt style(s) to sample from (default: normal).",
+    )
+    ap.add_argument(
+        "--prompt-dir",
+        default="prompts",
+        help="Directory containing optional <style>_system.txt and <style>_user.txt overrides.",
+    )
     return ap.parse_args()
-
-def log(*a): print(*a, flush=True)
-def ensure_outdir(d): os.makedirs(d, exist_ok=True)
 def save_text(path: str, txt: str):
     with open(path, "w", encoding="utf-8") as f: f.write(txt)
 
@@ -203,51 +216,6 @@ def crossover(a, b):
     return (a[-2] < b[-2]) and (a[-1] > b[-1])
 
 # -------------------------
-# LLM prompts
-# -------------------------
-SYSTEM_PROMPT = """You are an expert quantitative strategist.
-Output ONLY a Python code block that defines a Backtesting.py Strategy named `Strat`.
-Rules:
-- Use only numpy, pandas, Strategy API.
-- SMA, RSI, and crossover are AVAILABLE in the environment; you can call them directly.
-- Register indicators via self.I(...).
-- Provide class parameters as class variables (e.g., n1=10).
-- Trade in next() using crossover(...) or simple comparisons.
-- No external imports / I/O / plotting / print.
-- Keep code short and runnable.
-"""
-
-USER_TASK_TMPL = """Design a simple rule-based trading strategy for {SYMBOL} daily OHLCV data.
-Constraints:
-- Define `class Strat(Strategy):` with parameters and init/next methods.
-- You may use SMA, RSI, and crossover (available) via self.I(...)
-- Commission is handled externally; you don't need to apply it.
-Return ONLY code wrapped in a Python code block like:
-```python
-# your code here
-```"""
-
-def extract_code(txt: str) -> Optional[str]:
-    m = re.findall(r"```(?:python)?\s*(.+?)```", txt, flags=re.S|re.I)
-    if m: return m[0].strip()
-    return txt.strip() if "class Strat" in txt else None
-
-def build_messages(prompt: str) -> List[Dict[str,str]]:
-    return [{"role":"system","content":SYSTEM_PROMPT},{"role":"user","content":prompt}]
-
-def chat_once(tok, mdl, prompt: str, max_new_tokens=320, temperature=0.7) -> str:
-    msgs = build_messages(prompt)
-    text = tok.apply_chat_template(msgs, add_generation_prompt=True, tokenize=False)
-    enc  = tok(text, return_tensors="pt"); enc  = {k:v.to(mdl.device) for k,v in enc.items()}
-    eot  = tok.eos_token_id
-    out  = mdl.generate(
-        **enc, max_new_tokens=max_new_tokens, do_sample=True,
-        temperature=float(temperature), eos_token_id=eot, pad_token_id=eot,
-    )
-    new_tokens = out[0, enc["input_ids"].shape[1]:]
-    return tok.decode(new_tokens, skip_special_tokens=True)
-
-# -------------------------
 # Strategy sandbox
 # -------------------------
 ALLOWED_GLOBALS = {
@@ -293,56 +261,127 @@ def fitness_from_stats(st: pd.Series) -> float:
 # -------------------------
 def main():
     args = get_args()
-    random.seed(args.seed); np.random.seed(args.seed)
-    ensure_outdir(args.outdir)
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+
+    outdir = ensure_dir(args.outdir)
+
+    prompt_dir = Path(args.prompt_dir).expanduser() if args.prompt_dir else None
+    prompt_dir_display = "built-in defaults"
+    if prompt_dir:
+        if prompt_dir.exists():
+            prompt_dir_display = str(prompt_dir)
+        else:
+            log(f"[WARN] prompt dir {prompt_dir} not found, using built-in templates")
+            prompt_dir = None
+
+    prompt_library = PromptLibrary(base_dir=prompt_dir)
+    style_tokens = [token.strip().lower() for token in args.prompt_style.split(",") if token.strip()]
+    if not style_tokens:
+        style_tokens = ["normal"]
+    unique_style_tokens: List[str] = []
+    for token in style_tokens:
+        if token not in unique_style_tokens:
+            unique_style_tokens.append(token)
+
+    resolved_styles: List[PromptStyle] = []
+    for token in unique_style_tokens:
+        try:
+            resolved_styles.append(PromptStyle(token))
+        except ValueError:
+            log(f"[WARN] unknown prompt style '{token}', falling back to 'normal'")
+            resolved_styles.append(PromptStyle.NORMAL)
+
+    templates = {style: prompt_library.get(style) for style in resolved_styles}
+    default_template = templates[resolved_styles[0]]
+
+    prompt_specs: List[Dict[str, Any]] = []
+    for idx in range(args.population):
+        style = resolved_styles[idx % len(resolved_styles)]
+        template = templates[style]
+        prompt_specs.append(
+            {
+                "index": idx + 1,
+                "style": style,
+                "template": template,
+                "prompt": template.user.format(symbol=args.symbol),
+            }
+        )
 
     span_start = min(args.train_start, args.test_start)
-    span_end   = max(args.train_end, args.test_end)
-    df_all  = load_prices(args.symbol, span_start, span_end)
+    span_end = max(args.train_end, args.test_end)
+    df_all = load_prices(args.symbol, span_start, span_end)
     df_train = slice_df(df_all, args.train_start, args.train_end)
-    df_test  = slice_df(df_all, args.test_start,  args.test_end)
+    df_test = slice_df(df_all, args.test_start, args.test_end)
     log(f"[INFO] split: train={len(df_train)} test={len(df_test)}")
 
-    tok = AutoTokenizer.from_pretrained(args.model_dir, use_fast=True, trust_remote_code=True)
-    mdl = AutoModelForCausalLM.from_pretrained(args.model_dir, device_map="auto", dtype=torch.bfloat16, trust_remote_code=True)
-    log(f"[INFO] model loaded on {mdl.device}")
+    tokenizer = AutoTokenizer.from_pretrained(args.model_dir, use_fast=True, trust_remote_code=True)
+    model = AutoModelForCausalLM.from_pretrained(
+        args.model_dir,
+        device_map="auto",
+        dtype=torch.bfloat16,
+        trust_remote_code=True,
+    )
+    log(f"[INFO] model loaded on {model.device}")
+    client = LocalHFClient(tokenizer=tokenizer, model=model, system_prompt=default_template.system)
 
-    prompts = [USER_TASK_TMPL.format(SYMBOL=args.symbol) for _ in range(args.population)]
+    gen_dir = ensure_dir(outdir / "gen01_codes")
+    rows: List[Dict[str, Any]] = []
 
-    gen_dir = os.path.join(args.outdir, "gen01_codes")
-    ensure_outdir(gen_dir)
-    rows = []
-
-    for i, pr in enumerate(prompts, 1):
-        log(f"[GEN] {i}/{len(prompts)}")
-        txt  = chat_once(tok, mdl, pr, max_new_tokens=args.max_new_tokens, temperature=args.temperature)
-        code = extract_code(txt)
+    for spec in prompt_specs:
+        idx = spec["index"]
+        template = spec["template"]
+        prompt_text = spec["prompt"]
+        log(f"[GEN] {idx}/{len(prompt_specs)} style={template.name}")
+        raw = client.generate(
+            prompt_text,
+            max_new_tokens=args.max_new_tokens,
+            temperature=args.temperature,
+            system_prompt=template.system,
+        )
+        code = extract_code_blocks(raw)
         if not code:
-            log("[WARN] no code extracted"); continue
+            log("[WARN] no code extracted")
+            continue
         Strat = safe_exec_strategy(code)
         if Strat is None:
-            log("[WARN] no valid Strat class"); continue
+            log("[WARN] no valid Strat class")
+            continue
 
         try:
             st_train, _ = run_bt(df_train, Strat, args.commission)
-            st_test, _  = run_bt(df_test,  Strat, args.commission)
+            st_test, _ = run_bt(df_test, Strat, args.commission)
             fit = fitness_from_stats(st_train)
-            code_path = os.path.join(gen_dir, f"strat_{i:03d}.py")
+            code_path = gen_dir / f"strat_{idx:03d}.py"
+            raw_path = gen_dir / f"raw_{idx:03d}.txt"
             save_text(code_path, code)
+            save_text(raw_path, raw)
             row = {
-                "id": i, "fitness": fit,
+                "id": idx,
+                "prompt_style": template.name,
+                "prompt_user": prompt_text,
+                "fitness": fit,
                 "train_Return_%": float(st_train.get("Return [%]", float("nan"))),
                 "train_Sharpe": float(st_train.get("Sharpe Ratio", float("nan"))),
                 "train_MaxDD_%": float(st_train.get("Max. Drawdown [%]", float("nan"))),
                 "test_Return_%": float(st_test.get("Return [%]", float("nan"))),
                 "test_Sharpe": float(st_test.get("Sharpe Ratio", float("nan"))),
                 "test_MaxDD_%": float(st_test.get("Max. Drawdown [%]", float("nan"))),
-                "code_path": code_path
+                "code_path": str(code_path),
+                "raw_path": str(raw_path),
             }
             rows.append(row)
-            log(f"[OK] id={i} fit={fit:.2f} trainR={row['train_Return_%']:.2f} testR={row['test_Return_%']:.2f}")
-        except Exception as e:
-            log(f"[WARN] backtest failed: {e}")
+            log(
+                "[OK] id={id} style={style} fit={fit:.2f} trainR={train_Return_%:.2f} testR={test_Return_%:.2f}".format(
+                    id=idx,
+                    style=template.name,
+                    fit=fit,
+                    train_Return_=row["train_Return_%"],
+                    test_Return_=row["test_Return_%"],
+                )
+            )
+        except Exception as exc:
+            log(f"[WARN] backtest failed: {exc}")
             continue
 
     if not rows:
@@ -350,26 +389,30 @@ def main():
         return
 
     df_res = pd.DataFrame(rows).sort_values("fitness", ascending=False)
-    df_res.to_csv(os.path.join(args.outdir, "gen01.csv"), index=False)
+    result_csv = outdir / "gen01.csv"
+    df_res.to_csv(result_csv, index=False)
     best = df_res.iloc[0].to_dict()
-    save_text(os.path.join(args.outdir, "best_strategy.py"), open(best["code_path"], "r", encoding="utf-8").read())
-    save_text(os.path.join(args.outdir, "best_metrics.json"), json.dumps(best, indent=2, ensure_ascii=False))
-    save_text(os.path.join(args.outdir, "README.txt"), textwrap.dedent(f"""
-    symbol: {args.symbol}
-    train: {args.train_start} ~ {args.train_end}
-    test : {args.test_start} ~ {args.test_end}
-    population: {args.population}
-    generations: {args.generations} (this demo generates 1st gen only)
-    commission: {args.commission}
-    files:
-      - gen01.csv
-      - gen01_codes/
-      - best_strategy.py
-      - best_metrics.json
-    """).strip())
 
-    log(f"[INFO] generation 1 done, valid={len(df_res)}; best fitness={best['fitness']:.2f}")
-    log(f"[INFO] results -> {args.outdir}")
+    best_code = Path(best["code_path"]).read_text(encoding="utf-8")
+    save_text(outdir / "best_strategy.py", best_code)
+    save_text(outdir / "best_metrics.json", json.dumps(best, indent=2, ensure_ascii=False))
+    readme = textwrap.dedent(
+        f"""
+        symbol: {args.symbol}
+        train: {args.train_start} ~ {args.train_end}
+        test : {args.test_start} ~ {args.test_end}
+        population: {args.population}
+        temperature: {args.temperature}
+        commission: {args.commission}
+        model_dir: {args.model_dir}
+        prompt_styles: {", ".join(style.value for style in resolved_styles)}
+        prompt_dir: {prompt_dir_display}
+        """
+    ).strip()
+    save_text(outdir / "README.txt", readme + "\n")
+    log(f"[INFO] generation 1 done, valid={len(rows)}, best id={int(best['id'])}")
+    log(f"[INFO] results -> {outdir}")
+
 
 if __name__ == "__main__":
     main()

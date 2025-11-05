@@ -1,0 +1,9 @@
+Design a simple rule-based trading strategy for {symbol} daily OHLCV data.
+Constraints:
+- Define `class Strat(Strategy):` with parameters and init/next methods.
+- You may use SMA, RSI, and crossover (available) via self.I(...)
+- Commission is handled externally; you don't need to apply it.
+Return ONLY code wrapped in a Python code block like:
+```python
+# your code here
+```

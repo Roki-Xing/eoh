@@ -1,0 +1,4 @@
+Build a conservative daily trading strategy for {symbol} that prioritises stability and low drawdown.
+Use class `Strat(Strategy)` and rely on SMA/RSI/crossover helpers.
+Favour filters that avoid whipsaw trades, and require multiple confirmations before entering.
+Return ONLY code in a Python fenced block.
