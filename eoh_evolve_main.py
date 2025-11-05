@@ -1,398 +1,454 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-EOH evolve main (framework-style, no external llm4ad dependency)
-- 参数族：仅使用稳健的布林轨突破 (BBreak) 家族，参数 (n, k, h)
-- 风控参数：slippage_bps, delay_days, max_position, max_daily_turnover, min_trades, min_exposure
-- 适应度：fit = α*Sharpe + β*Return − γ*MDD − δ*Turnover − ζ*CostRatio
-- 训练/测试融合：fitness = 0.8 * fit_test + 0.2 * fit_train
-- 输出：每代 genXX.csv，记录所有候选的指标；最后打印 [BEST]
+Modularised evolution loop for the Bollinger Breakout (BBreak) strategy family.
+
+The script now delegates data loading, backtesting, fitness scoring, and logging
+to the shared `eoh_core` package. This reduces duplication with the export and
+GPU scripts and makes it easier to plug the engine into other orchestration
+workflows or test harnesses.
 """
-import os, re, sys, json, math, random, argparse, warnings
-from dataclasses import dataclass
-from typing import Tuple, Dict, Any, List
+
+from __future__ import annotations
+
+import argparse
+import json
+import random
+from dataclasses import asdict, dataclass
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+
 import numpy as np
 import pandas as pd
-import matplotlib
-matplotlib.use("Agg")  # no display env
-from datetime import datetime
 
-# -------------------------
-# Utils
-# -------------------------
-def log(msg: str):
-    print(msg, flush=True)
+from eoh_core import (
+    BBreakParams,
+    FitnessWeights,
+    RiskParams,
+    backtest_bbreak,
+    blended_score,
+    enforce_constraints,
+    metric_score,
+    robust_read_csv,
+    slice_by_date,
+)
+from eoh_core.strategies import BacktestMetrics
+from eoh_core.utils import ensure_dir, log
 
-def ensure_outdir(d: str):
-    os.makedirs(d, exist_ok=True)
 
-def robust_read_csv(csv_path: str) -> pd.DataFrame:
-    if not os.path.isfile(csv_path):
-        raise FileNotFoundError(csv_path)
-    df = pd.read_csv(csv_path)
-    # find a time column
-    time_cols = [c for c in df.columns if str(c).lower() in ("date","datetime","timestamp","time")]
-    if not time_cols:
-        # try index if looks like date strings
-        if df.index.name and str(df.index.name).lower() in ("date","datetime","timestamp","time"):
-            df.index = pd.to_datetime(df.index, errors="coerce", utc=False)
-            df = df.sort_index()
-        else:
-            # common yahoo style 'Date'
-            if "Date" in df.columns:
-                time_col = "Date"
-            else:
-                # last try: first column
-                time_col = df.columns[0]
-            df[time_col] = pd.to_datetime(df[time_col], errors="coerce", utc=False)
-            df = df[~df[time_col].isna()].copy()
-            df = df.set_index(time_col)
-    else:
-        time_col = time_cols[0]
-        df[time_col] = pd.to_datetime(df[time_col], errors="coerce", utc=False)
-        df = df[~df[time_col].isna()].copy()
-        df = df.set_index(time_col)
-    # unify col names
-    cols_low = {c: str(c).strip() for c in df.columns}
-    df = df.rename(columns=cols_low)
-    # prefer 'Close' column
-    close_candidates = [c for c in df.columns if str(c).lower() in ("close","adj close","adj_close","price")]
-    if not close_candidates:
-        raise ValueError("CSV缺少收盘价列(如 Close/Adj Close)")
-    # if Adj Close exists, prefer it
-    pick = None
-    for cand in ("Adj Close","adj close","adj_close","Close","close","price"):
-        if cand in df.columns:
-            pick = cand
-            break
-    if pick is None:
-        pick = close_candidates[0]
-    df["Close"] = df[pick].astype(float)
-    df = df[~df["Close"].isna()]
-    return df.sort_index()
-
-def slice_by_date(df: pd.DataFrame, start: str, end: str) -> pd.DataFrame:
-    s = pd.Timestamp(start)
-    e = pd.Timestamp(end)
-    df = df[(df.index >= s) & (df.index <= e)].copy()
-    return df
-
-# -------------------------
-# BBreak backtest with risk knobs
-# -------------------------
-@dataclass
-class BBreakParams:
-    n: int
-    k: float
-    h: int
-
-@dataclass
-class RiskParams:
-    commission: float = 0.0     # proportional commission per trade (e.g. 0.0005)
-    slippage_bps: float = 0.0   # basis points per trade (e.g. 2 bps => 0.0002)
-    delay_days: int = 0         # order execution delay (days)
-    max_position: float = 1.0   # cap position, here pos in {0,1}, cap must be >=1.0 to allow full
-    max_daily_turnover: float = 1.0 # with 0/1 positions, turnover/day <=1 anyway
-    min_trades: int = 0
-    min_exposure: float = 0.0   # fraction [0,1]
-
-def compute_bbands(close: pd.Series, n: int, k: float) -> Tuple[pd.Series, pd.Series, pd.Series]:
-    ma = close.rolling(n, min_periods=n).mean()
-    sd = close.rolling(n, min_periods=n).std(ddof=0)
-    upper = ma + k * sd
-    lower = ma - k * sd
-    return ma, upper, lower
-
-def backtest_bbreak(
-    df: pd.DataFrame,
-    p: BBreakParams,
-    r: RiskParams
-) -> Tuple[pd.DataFrame, pd.DataFrame, pd.Series, Dict[str, float]]:
+def parse_objectives(value: str) -> List[Tuple[str, bool]]:
     """
-    Returns: trades_df, positions_df, equity_series, metrics
-    trades: [timestamp, side, price, size, reason]
-    positions: [timestamp, position, price, equity]
-    equity starts at 1.0
+    Parse objective specification string, e.g. "testReturn+,testSharpe+,testMDD-".
+    The trailing '+' means maximise, '-' means minimise.
     """
-    px = df["Close"].astype(float).copy()
-    ma, up, lo = compute_bbands(px, p.n, p.k)
-
-    # signals (pre-delay)
-    buy_sig  = (px > up)
-    sell_sig = (px < ma)  # exit rule after min-hold
-
-    # apply delay
-    if r.delay_days > 0:
-        buy_sig = buy_sig.shift(r.delay_days)
-        sell_sig = sell_sig.shift(r.delay_days)
-
-    pos = 0
-    last_buy_idx = None
-    equity = []
-    positions = []
-    trades = []
-    cash = 1.0
-    units = 0.0  # with 0/1 pos we use "one unit = all-in", keep simple
-    prev_price = None
-
-    # helper for cost/slippage on trade price
-    def exec_price(side: str, price: float) -> float:
-        slip = price * (r.slippage_bps * 1e-4)
-        if side == "BUY":
-            ex = price + slip
+    objectives: List[Tuple[str, bool]] = []
+    for token in value.split(","):
+        token = token.strip()
+        if not token:
+            continue
+        if token[-1] in {"+", "-"}:
+            column = token[:-1]
+            maximise = token[-1] == "+"
         else:
-            ex = price - slip
-        return ex
+            column = token
+            maximise = True
+        objectives.append((column, maximise))
+    return objectives
 
-    # We'll track daily returns via equity series; when in pos=1, daily PnL follows price ratio
-    # with commissions at trade times.
-    # Here we simulate discrete trades with full notional.
-    for i, (dt, price) in enumerate(px.items()):
-        # carry equity mark-to-market
-        if prev_price is None:
-            eq = 1.0
-        else:
-            if pos == 1:
-                eq = equity[-1] * (price / prev_price)
-            else:
-                eq = equity[-1]
-        # check turnover cap: with 0/1 it's naturally okay; record later
-        reason = None
-        # enter
-        if pos == 0 and buy_sig.iloc[i] and not np.isnan(buy_sig.iloc[i]):
-            # open long
-            ex = exec_price("BUY", price)
-            # apply commission
-            eq *= (1.0 - r.commission)
-            pos = 1
-            last_buy_idx = i
-            reason = "break_up"
-            trades.append({"timestamp": dt, "side":"BUY","price": float(ex),"size":1,"reason":reason})
-            # Mark equity after commission (we don't change notional units in this simple model)
-            eq = eq  # already applied commission
-        # exit
-        elif pos == 1:
-            can_exit = True
-            if last_buy_idx is not None and (i - last_buy_idx) < p.h:
-                can_exit = False
-            if can_exit and sell_sig.iloc[i] and not np.isnan(sell_sig.iloc[i]):
-                ex = exec_price("SELL", price)
-                eq *= (1.0 - r.commission)
-                pos = 0
-                reason = "below_ma"
-                trades.append({"timestamp": dt,"side":"SELL","price": float(ex),"size":1,"reason":reason})
-        equity.append(eq)
-        positions.append({"timestamp": dt, "position": pos, "price": float(price), "equity": float(eq)})
-        prev_price = price
 
-    equity = pd.Series(equity, index=px.index, name="equity")
-    positions_df = pd.DataFrame(positions)
-    trades_df = pd.DataFrame(trades)
+def parse_weight_presets(value: str) -> Dict[str, FitnessWeights]:
+    """
+    Parse presets like "return:alpha=0.5,beta=1.5;balanced:alpha=1,beta=0.7,gamma=1.2".
+    Missing coefficients fall back to FitnessWeights defaults.
+    """
+    presets: Dict[str, FitnessWeights] = {}
+    for chunk in value.split(";"):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        if ":" not in chunk:
+            raise ValueError(f"Invalid weight preset '{chunk}'")
+        name, spec = chunk.split(":", 1)
+        coeffs: Dict[str, float] = {}
+        for pair in spec.split(","):
+            pair = pair.strip()
+            if not pair:
+                continue
+            if "=" not in pair:
+                raise ValueError(f"Invalid coefficient '{pair}' in preset '{name}'")
+            key, raw = pair.split("=", 1)
+            coeffs[key.strip()] = float(raw.strip())
+        presets[name.strip()] = FitnessWeights(**coeffs)
+    return presets
 
-    # metrics
-    daily_ret = equity.pct_change().fillna(0.0)
-    total_ret = equity.iloc[-1] / equity.iloc[0] - 1.0 if len(equity)>1 else 0.0
-    sharpe = 0.0
-    if daily_ret.std(ddof=0) > 1e-12:
-        sharpe = (daily_ret.mean() / daily_ret.std(ddof=0)) * np.sqrt(252.0)
-    # drawdown
-    roll_max = equity.cummax()
-    dd = equity/roll_max - 1.0
-    mdd = dd.min() if len(dd)>0 else 0.0
-    # exposure
-    exposure = positions_df["position"].mean() if len(positions_df)>0 else 0.0
-    # turnover proxy (changes in position)
-    if len(positions_df)>1:
-        pos_change = positions_df["position"].diff().abs().fillna(0.0)
-        ts = pd.to_datetime(positions_df["timestamp"], errors="coerce"); pos_change = positions_df["position"].diff().abs().fillna(0.0); daily_turnover = pos_change.groupby(ts.dt.normalize()).sum().mean(); daily_turnover = 0.0 if pd.isna(daily_turnover) else daily_turnover
-        # since pos in {0,1}, daily_turnover<=1 usually
-    else:
-        daily_turnover = 0.0
-    # cost ratio approx = total trade count * (commission + slippage_bp) / period_len
-    trades_count = len(trades_df)
-    cost_ratio = trades_count * (r.commission + r.slippage_bps * 1e-4)
-    metrics = {
-        "return": float(total_ret),
-        "sharpe": float(sharpe),
-        "mdd": float(mdd),
-        "trades": int(trades_count),
-        "exposure": float(exposure),
-        "turnover": float(daily_turnover),
-        "cost_ratio": float(cost_ratio),
-    }
-    return trades_df, positions_df, equity, metrics
 
-def fitness_from_metrics(m: Dict[str, float], alpha: float, beta: float, gamma: float, delta: float, zeta: float) -> float:
-    # Return is plain return %, Sharpe as is, MDD negative number (e.g. -0.12)
-    # We want penalty by |MDD|, so use -gamma * abs(mdd)
-    return (alpha * m["sharpe"] + beta * (m["return"] * 100.0)  # scale return to %
-            - gamma * abs(m["mdd"]) * 100.0
-            - delta * (m.get("turnover", 0.0) * 100.0)
-            - zeta  * (m.get("cost_ratio", 0.0) * 100.0))
+DEFAULT_OBJECTIVES: List[Tuple[str, bool]] = [
+    ("testReturn", True),
+    ("testSharpe", True),
+    ("testMDD", False),
+]
 
-# -------------------------
-# Evolution
-# -------------------------
+
+def make_name(params: BBreakParams) -> str:
+    return f"BBreak_n{params.n}_k{params.k}_h{params.h}"
+
+
 def sample_params(rng: random.Random) -> BBreakParams:
-    n = rng.randint(5, 40)
-    k = round(rng.uniform(0.5, 1.8), 2)
-    h = rng.randint(2, 10)
-    return BBreakParams(n=n, k=k, h=h)
+    return BBreakParams(
+        n=rng.randint(5, 40),
+        k=round(rng.uniform(0.5, 1.8), 2),
+        h=rng.randint(2, 10),
+    )
+
 
 def mutate_params(base: BBreakParams, rng: random.Random) -> BBreakParams:
-    n = max(3, int(round(base.n + rng.gauss(0, 5))))
-    k = round(max(0.4, base.k + rng.gauss(0, 0.2)), 2)
-    h = max(1, int(round(base.h + rng.gauss(0, 2))))
-    n = min(80, n)
-    k = min(3.0, k)
-    h = min(20, h)
+    n = min(80, max(3, int(round(base.n + rng.gauss(0, 5)))))
+    k = min(3.0, round(max(0.4, base.k + rng.gauss(0, 0.2)), 2))
+    h = min(20, max(1, int(round(base.h + rng.gauss(0, 2)))))
     return BBreakParams(n=n, k=k, h=h)
 
-def make_name(p: BBreakParams) -> str:
-    return f"BBreak_n{p.n}_k{p.k}_h{p.h}"
 
-def eval_candidate(df_train: pd.DataFrame, df_test: pd.DataFrame, p: BBreakParams,
-                   rp: RiskParams, alpha: float, beta: float, gamma: float, delta: float, zeta: float):
-    # train
-    tr_tr, tr_pos, tr_eq, tr_m = backtest_bbreak(df_train, p, rp)
-    # test
-    te_tr, te_pos, te_eq, te_m = backtest_bbreak(df_test, p, rp)
-    # constraints on test为主
-    feasible = True
-    if rp.min_trades > 0 and te_m["trades"] < rp.min_trades:
-        feasible = False
-    if rp.min_exposure > 0 and te_m["exposure"] < rp.min_exposure:
-        feasible = False
-    name = make_name(p)
-    fit_train = fitness_from_metrics(tr_m, alpha, beta, gamma, delta, zeta)
-    fit_test  = fitness_from_metrics(te_m, alpha, beta, gamma, delta, zeta)
-    fitness = 0.8 * fit_test + 0.2 * fit_train if feasible else -1e9
-    row = {
-        "name": name,
-        "family": "BBreak",
-        "params": json.dumps({"n": p.n, "k": p.k, "h": p.h}),
-        "trainReturn": tr_m["return"],
-        "trainSharpe": tr_m["sharpe"],
-        "trainMDD": tr_m["mdd"],
-        "trainTrades": tr_m["trades"],
-        "trainExposure": tr_m["exposure"],
-        "testReturn": te_m["return"],
-        "testSharpe": te_m["sharpe"],
-        "testMDD": te_m["mdd"],
-        "testTrades": te_m["trades"],
-        "testExposure": te_m["exposure"],
-        "fitness": fitness,
-        "feasible": int(feasible),
-    }
-    return row
+@dataclass
+class CandidateSummary:
+    params: BBreakParams
+    train_metrics: dict
+    test_metrics: dict
+    train_score: float
+    test_score: float
+    fitness: float
+    feasible: bool
 
-# -------------------------
-# Main
-# -------------------------
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--model-dir", required=True)
-    ap.add_argument("--symbol", default="SPY")
-    ap.add_argument("--csv", required=True)
-    ap.add_argument("--train_start", required=True)
-    ap.add_argument("--train_end", required=True)
-    ap.add_argument("--test_start", required=True)
-    ap.add_argument("--test_end", required=True)
-    ap.add_argument("--population", type=int, default=56)
-    ap.add_argument("--generations", type=int, default=3)
-    ap.add_argument("--topk", type=int, default=8)
-    ap.add_argument("--commission", type=float, default=0.0005)
-    ap.add_argument("--seed", type=int, default=42)
-    ap.add_argument("--outdir", required=True)
-    ap.add_argument("--use-llm", dest="use_llm", action="store_true", help="只作为标记，不依赖外部包")
-    # 风控与适应度
-    ap.add_argument("--slippage-bps", type=float, default=0.0)
-    ap.add_argument("--delay-days", type=int, default=0)
-    ap.add_argument("--max-position", type=float, default=1.0)
-    ap.add_argument("--max-daily-turnover", type=float, default=1.0)
-    ap.add_argument("--min-trades", type=int, default=0)
-    ap.add_argument("--min-exposure", type=float, default=0.0)
-    ap.add_argument("--alpha", type=float, default=1.0)
-    ap.add_argument("--beta", type=float, default=0.5)
-    ap.add_argument("--gamma", type=float, default=1.0)
-    ap.add_argument("--delta", type=float, default=0.0)
-    ap.add_argument("--zeta", type=float, default=0.0)
-    args = ap.parse_args()
+    def to_row(self) -> dict:
+        return {
+            "name": make_name(self.params),
+            "family": "BBreak",
+            "params": json.dumps(asdict(self.params)),
+            "trainReturn": self.train_metrics["return"],
+            "trainSharpe": self.train_metrics["sharpe"],
+            "trainMDD": self.train_metrics["mdd"],
+            "trainTrades": self.train_metrics["trades"],
+            "trainExposure": self.train_metrics["exposure"],
+            "trainTurnover": self.train_metrics["turnover"],
+            "trainCostRatio": self.train_metrics["cost_ratio"],
+            "testReturn": self.test_metrics["return"],
+            "testSharpe": self.test_metrics["sharpe"],
+            "testMDD": self.test_metrics["mdd"],
+            "testTrades": self.test_metrics["trades"],
+            "testExposure": self.test_metrics["exposure"],
+            "testTurnover": self.test_metrics["turnover"],
+            "testCostRatio": self.test_metrics["cost_ratio"],
+            "trainFitness": self.train_score,
+            "testFitness": self.test_score,
+            "fitness": self.fitness,
+            "feasible": int(self.feasible),
+        }
+
+
+@dataclass
+class EvolutionConfig:
+    population: int
+    generations: int
+    topk: int
+    weights: FitnessWeights
+    risk: RiskParams
+    test_share: float = 0.8
+    multi_objective: bool = False
+    objectives: Optional[Sequence[Tuple[str, bool]]] = None
+    weight_presets: Optional[Dict[str, FitnessWeights]] = None
+
+
+class EvolutionEngine:
+    def __init__(
+        self,
+        df_train: pd.DataFrame,
+        df_test: pd.DataFrame,
+        outdir: str,
+        config: EvolutionConfig,
+        rng: random.Random,
+    ) -> None:
+        if df_train.empty or df_test.empty:
+            raise ValueError("Train/test 时间段无数据")
+        self.df_train = df_train
+        self.df_test = df_test
+        self.outdir = ensure_dir(outdir)
+        self.config = config
+        self.rng = rng
+        self.objectives = list(self.config.objectives or DEFAULT_OBJECTIVES)
+        self.history_rows: List[dict] = []
+
+    def _initial_population(self) -> List[BBreakParams]:
+        return [sample_params(self.rng) for _ in range(self.config.population)]
+
+    def _load_elites(self, generation: int) -> List[BBreakParams]:
+        prev_path = self.outdir / f"gen{generation:02d}.csv"
+        if not prev_path.exists():
+            return []
+        prev = pd.read_csv(prev_path)
+        if prev.empty or "params" not in prev.columns:
+            return []
+        prev = prev.sort_values("fitness", ascending=False).head(min(self.config.topk, len(prev)))
+        elites: List[BBreakParams] = []
+        for _, row in prev.iterrows():
+            try:
+                params = json.loads(row["params"])
+                elites.append(
+                    BBreakParams(
+                        n=int(params["n"]),
+                        k=float(params["k"]),
+                        h=int(params["h"]),
+                    )
+                )
+            except Exception as exc:  # pragma: no cover - defensive logging
+                log(f"[WARN] failed to parse params from previous generation: {exc}")
+        return elites
+
+    def _mutate_population(self, seeds: Sequence[BBreakParams]) -> List[BBreakParams]:
+        if not seeds:
+            return self._initial_population()
+        new_pop: List[BBreakParams] = []
+        while len(new_pop) < self.config.population:
+            base = self.rng.choice(seeds)
+            new_pop.append(mutate_params(base, self.rng))
+        return new_pop
+
+    def _summarise(self, params: BBreakParams) -> CandidateSummary:
+        train_result = backtest_bbreak(self.df_train, params, self.config.risk)
+        test_result = backtest_bbreak(self.df_test, params, self.config.risk)
+
+        feasible = enforce_constraints(test_result, self.config.risk)
+        train_score = metric_score(train_result.metrics, self.config.weights)
+        test_score = metric_score(test_result.metrics, self.config.weights)
+        if feasible:
+            fitness = blended_score(
+                train_result.metrics,
+                test_result.metrics,
+                self.config.weights,
+                self.config.test_share,
+            )
+        else:
+            fitness = -1e9
+
+        return CandidateSummary(
+            params=params,
+            train_metrics=train_result.metrics.as_dict(),
+            test_metrics=test_result.metrics.as_dict(),
+            train_score=float(train_score),
+            test_score=float(test_score),
+            fitness=float(fitness),
+            feasible=feasible,
+        )
+
+    def run_generation(self, generation: int, population: Iterable[BBreakParams]) -> pd.DataFrame:
+        rows = []
+        for idx, individual in enumerate(population, 1):
+            summary = self._summarise(individual)
+            row_dict = summary.to_row()
+            row_dict["generation"] = generation
+            rows.append(row_dict)
+            log(
+                f"[GEN {generation:02d}] {idx:03d}/{self.config.population} "
+                f"{row_dict['name']} fitness={summary.fitness:.4f} feasible={summary.feasible}"
+            )
+        frame = pd.DataFrame(rows)
+        path = self.outdir / f"gen{generation:02d}.csv"
+        frame.to_csv(path, index=False)
+        log(f"[INFO] gen{generation:02d} -> {path}")
+        if not frame.empty:
+            self.history_rows.extend(frame.to_dict("records"))
+        return frame
+
+    def _normalise_objective(self, frame: pd.DataFrame, column: str, maximise: bool) -> pd.Series:
+        values = frame[column].astype(float)
+        if maximise:
+            return values
+        if "mdd" in column.lower() or "drawdown" in column.lower():
+            return -values.abs()
+        return -values
+
+    def _pareto_front(self, frame: pd.DataFrame) -> pd.DataFrame:
+        if frame.empty or not self.objectives:
+            return frame.copy()
+        scores = [
+            self._normalise_objective(frame, column, maximise).to_numpy()
+            for column, maximise in self.objectives
+        ]
+        matrix = np.vstack(scores).T
+        mask = np.ones(len(frame), dtype=bool)
+        for i in range(len(frame)):
+            if not mask[i]:
+                continue
+            for j in range(len(frame)):
+                if i == j or not mask[j]:
+                    continue
+                if np.all(matrix[j] >= matrix[i]) and np.any(matrix[j] > matrix[i]):
+                    mask[i] = False
+                    break
+        return frame.loc[mask].copy()
+
+    def _write_multiobjective_outputs(self, aggregated: pd.DataFrame) -> None:
+        if aggregated.empty:
+            return
+        aggregated.to_csv(self.outdir / "all_candidates.csv", index=False)
+        if self.config.multi_objective:
+            front = self._pareto_front(aggregated)
+            front.to_csv(self.outdir / "pareto_front.csv", index=False)
+            log(f"[INFO] pareto front size={len(front)} -> {self.outdir / 'pareto_front.csv'}")
+
+    def _write_weight_presets(self, aggregated: pd.DataFrame) -> None:
+        if not self.config.weight_presets or aggregated.empty:
+            return
+        rows = []
+        for name, weights in self.config.weight_presets.items():
+            best_score = None
+            best_row = None
+            for record in aggregated.to_dict("records"):
+                metrics = BacktestMetrics(
+                    total_return=float(record.get("testReturn", 0.0)),
+                    sharpe=float(record.get("testSharpe", 0.0)),
+                    max_drawdown=float(record.get("testMDD", 0.0)),
+                    trades=int(record.get("testTrades", 0)),
+                    exposure=float(record.get("testExposure", 0.0)),
+                    turnover=float(record.get("testTurnover", 0.0)),
+                    cost_ratio=float(record.get("testCostRatio", 0.0)),
+                )
+                score = metric_score(metrics, weights)
+                if best_score is None or score > best_score:
+                    best_score = score
+                    best_row = record
+            if best_row is not None:
+                rows.append(
+                    {
+                        "preset": name,
+                        "score": best_score,
+                        "candidate": best_row["name"],
+                        "params": best_row["params"],
+                        "testReturn": best_row.get("testReturn"),
+                        "testSharpe": best_row.get("testSharpe"),
+                        "testMDD": best_row.get("testMDD"),
+                    }
+                )
+        if rows:
+            pd.DataFrame(rows).to_csv(self.outdir / "weight_presets_summary.csv", index=False)
+
+    def run(self) -> pd.Series | None:
+        population = self._initial_population()
+        best_row: pd.Series | None = None
+
+        for gen in range(1, self.config.generations + 1):
+            if gen > 1:
+                seeds = self._load_elites(gen - 1)
+                population = self._mutate_population(seeds if seeds else population)
+
+            frame = self.run_generation(gen, population)
+            if not frame.empty:
+                gen_best = frame.loc[frame["fitness"].idxmax()]
+                if best_row is None or gen_best["fitness"] > best_row["fitness"]:
+                    best_row = gen_best
+        aggregated = pd.DataFrame(self.history_rows)
+        if not aggregated.empty:
+            self._write_multiobjective_outputs(aggregated)
+            self._write_weight_presets(aggregated)
+        return best_row
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--model-dir", required=True)
+    parser.add_argument("--symbol", default="SPY")
+    parser.add_argument("--csv", required=True)
+    parser.add_argument("--train_start", required=True)
+    parser.add_argument("--train_end", required=True)
+    parser.add_argument("--test_start", required=True)
+    parser.add_argument("--test_end", required=True)
+    parser.add_argument("--population", type=int, default=56)
+    parser.add_argument("--generations", type=int, default=3)
+    parser.add_argument("--topk", type=int, default=8)
+    parser.add_argument("--commission", type=float, default=0.0005)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--outdir", required=True)
+    parser.add_argument("--use-llm", dest="use_llm", action="store_true", help="标记位（兼容旧参数）")
+    parser.add_argument("--slippage-bps", type=float, default=0.0)
+    parser.add_argument("--delay-days", type=int, default=0)
+    parser.add_argument("--max-position", type=float, default=1.0)
+    parser.add_argument("--max-daily-turnover", type=float, default=1.0)
+    parser.add_argument("--min-trades", type=int, default=0)
+    parser.add_argument("--min-exposure", type=float, default=0.0)
+    parser.add_argument("--alpha", type=float, default=1.0)
+    parser.add_argument("--beta", type=float, default=0.5)
+    parser.add_argument("--gamma", type=float, default=1.0)
+    parser.add_argument("--delta", type=float, default=0.0)
+    parser.add_argument("--zeta", type=float, default=0.0)
+    parser.add_argument("--test-share", type=float, default=0.8, help="测试集在整体 fitness 中的权重")
+    parser.add_argument(
+        "--multi-objective",
+        action="store_true",
+        help="启用多目标选择，生成帕累托前沿（基于 --objectives 配置）。",
+    )
+    parser.add_argument(
+        "--objectives",
+        default="testReturn+,testSharpe+,testMDD-",
+        help="逗号分隔的目标列，结尾 + 为最大化，- 为最小化，例如 testReturn+,testSharpe+,testMDD-。",
+    )
+    parser.add_argument(
+        "--weight-presets",
+        default="",
+        help="可选的权重预设，格式 name:alpha=1,beta=0.5;... 用于运行后比较不同权重下的最优解。",
+    )
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
 
     random.seed(args.seed)
     np.random.seed(args.seed)
 
-    ensure_outdir(args.outdir)
-
     df_all = robust_read_csv(args.csv)
     df_train = slice_by_date(df_all, args.train_start, args.train_end)
-    df_test  = slice_by_date(df_all, args.test_start, args.test_end)
-    if len(df_train)==0 or len(df_test)==0:
-        raise ValueError("train/test 时间段无数据")
+    df_test = slice_by_date(df_all, args.test_start, args.test_end)
 
-    rp = RiskParams(
+    risk = RiskParams(
         commission=args.commission,
         slippage_bps=args.slippage_bps,
         delay_days=args.delay_days,
         max_position=args.max_position,
         max_daily_turnover=args.max_daily_turnover,
         min_trades=args.min_trades,
-        min_exposure=args.min_exposure
+        min_exposure=args.min_exposure,
+    )
+    weights = FitnessWeights(
+        alpha=args.alpha,
+        beta=args.beta,
+        gamma=args.gamma,
+        delta=args.delta,
+        zeta=args.zeta,
+    )
+    objectives = parse_objectives(args.objectives) if args.objectives else DEFAULT_OBJECTIVES
+    if not objectives:
+        objectives = DEFAULT_OBJECTIVES
+    weight_presets = parse_weight_presets(args.weight_presets) if args.weight_presets.strip() else None
+    config = EvolutionConfig(
+        population=args.population,
+        generations=args.generations,
+        topk=args.topk,
+        weights=weights,
+        risk=risk,
+        test_share=args.test_share,
+        multi_objective=args.multi_objective,
+        objectives=objectives,
+        weight_presets=weight_presets,
     )
 
-    alpha, beta, gamma, delta, zeta = args.alpha, args.beta, args.gamma, args.delta, args.zeta
-
-    # -------- generation loop ----------
-    rng = random.Random(args.seed)
-    pop: List[BBreakParams] = []
-    for _ in range(args.population):
-        pop.append(sample_params(rng))
-
-    best_row = None
-
-    for g in range(1, args.generations+1):
-        rows = []
-        # seeds or elites mutated
-        if g > 1 and best_row is not None:
-            # start from previous topk params mutated
-            # reconstruct params from previous gen CSV
-            prev_csv = os.path.join(args.outdir, f"gen{g-1:02d}.csv")
-            if os.path.isfile(prev_csv):
-                prev = pd.read_csv(prev_csv)
-                prev = prev.sort_values("fitness", ascending=False)
-                seeds = []
-                for _, r in prev.head(min(args.topk, len(prev))).iterrows():
-                    j = json.loads(r["params"])
-                    seeds.append(BBreakParams(n=int(j["n"]), k=float(j["k"]), h=int(j["h"])))
-                # mutate seeds to fill population
-                new_pop = []
-                while len(new_pop) < args.population:
-                    base = rng.choice(seeds)
-                    new_pop.append(mutate_params(base, rng))
-                pop = new_pop
-            else:
-                # fallback
-                pop = [mutate_params(pop[rng.randrange(len(pop))], rng) for _ in range(args.population)]
-        # evaluate
-        for idx, p in enumerate(pop, 1):
-            row = eval_candidate(df_train, df_test, p, rp, alpha, beta, gamma, delta, zeta)
-            rows.append(row)
-        gen_df = pd.DataFrame(rows)
-        gen_path = os.path.join(args.outdir, f"gen{g:02d}.csv")
-        gen_df.to_csv(gen_path, index=False)
-        log(f"[INFO] gen{g:02d} -> {gen_path}")
-        # update best
-        if len(gen_df) > 0:
-            rbest = gen_df.iloc[gen_df["fitness"].argmax()]
-            if (best_row is None) or (rbest["fitness"] > best_row["fitness"]):
-                best_row = rbest
+    engine = EvolutionEngine(df_train, df_test, args.outdir, config, random.Random(args.seed))
+    best_row = engine.run()
 
     if best_row is not None:
-        name = best_row["name"]
-        log(f"[BEST] name={name} fitness={best_row['fitness']:.4f} "
-            f"trainR={best_row['trainReturn']*100:.2f}% testR={best_row['testReturn']*100:.2f}% "
-            f"trainSharpe={best_row['trainSharpe']:.2f} testSharpe={best_row['testSharpe']:.2f}")
-    log(f"[INFO] all generations done -> {args.outdir}")
+        log(
+            "[BEST] name={name} fitness={fitness:.4f} "
+            "trainR={trainReturn:.2%} testR={testReturn:.2%} "
+            "trainSharpe={trainSharpe:.2f} testSharpe={testSharpe:.2f}".format(**best_row.to_dict())
+        )
+    log(f"[INFO] all generations done -> {engine.outdir}")
+
 
 if __name__ == "__main__":
     main()
