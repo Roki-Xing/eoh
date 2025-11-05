@@ -1,0 +1,398 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+EOH evolve main (framework-style, no external llm4ad dependency)
+- 参数族：仅使用稳健的布林轨突破 (BBreak) 家族，参数 (n, k, h)
+- 风控参数：slippage_bps, delay_days, max_position, max_daily_turnover, min_trades, min_exposure
+- 适应度：fit = α*Sharpe + β*Return − γ*MDD − δ*Turnover − ζ*CostRatio
+- 训练/测试融合：fitness = 0.8 * fit_test + 0.2 * fit_train
+- 输出：每代 genXX.csv，记录所有候选的指标；最后打印 [BEST]
+"""
+import os, re, sys, json, math, random, argparse, warnings
+from dataclasses import dataclass
+from typing import Tuple, Dict, Any, List
+import numpy as np
+import pandas as pd
+import matplotlib
+matplotlib.use("Agg")  # no display env
+from datetime import datetime
+
+# -------------------------
+# Utils
+# -------------------------
+def log(msg: str):
+    print(msg, flush=True)
+
+def ensure_outdir(d: str):
+    os.makedirs(d, exist_ok=True)
+
+def robust_read_csv(csv_path: str) -> pd.DataFrame:
+    if not os.path.isfile(csv_path):
+        raise FileNotFoundError(csv_path)
+    df = pd.read_csv(csv_path)
+    # find a time column
+    time_cols = [c for c in df.columns if str(c).lower() in ("date","datetime","timestamp","time")]
+    if not time_cols:
+        # try index if looks like date strings
+        if df.index.name and str(df.index.name).lower() in ("date","datetime","timestamp","time"):
+            df.index = pd.to_datetime(df.index, errors="coerce", utc=False)
+            df = df.sort_index()
+        else:
+            # common yahoo style 'Date'
+            if "Date" in df.columns:
+                time_col = "Date"
+            else:
+                # last try: first column
+                time_col = df.columns[0]
+            df[time_col] = pd.to_datetime(df[time_col], errors="coerce", utc=False)
+            df = df[~df[time_col].isna()].copy()
+            df = df.set_index(time_col)
+    else:
+        time_col = time_cols[0]
+        df[time_col] = pd.to_datetime(df[time_col], errors="coerce", utc=False)
+        df = df[~df[time_col].isna()].copy()
+        df = df.set_index(time_col)
+    # unify col names
+    cols_low = {c: str(c).strip() for c in df.columns}
+    df = df.rename(columns=cols_low)
+    # prefer 'Close' column
+    close_candidates = [c for c in df.columns if str(c).lower() in ("close","adj close","adj_close","price")]
+    if not close_candidates:
+        raise ValueError("CSV缺少收盘价列(如 Close/Adj Close)")
+    # if Adj Close exists, prefer it
+    pick = None
+    for cand in ("Adj Close","adj close","adj_close","Close","close","price"):
+        if cand in df.columns:
+            pick = cand
+            break
+    if pick is None:
+        pick = close_candidates[0]
+    df["Close"] = df[pick].astype(float)
+    df = df[~df["Close"].isna()]
+    return df.sort_index()
+
+def slice_by_date(df: pd.DataFrame, start: str, end: str) -> pd.DataFrame:
+    s = pd.Timestamp(start)
+    e = pd.Timestamp(end)
+    df = df[(df.index >= s) & (df.index <= e)].copy()
+    return df
+
+# -------------------------
+# BBreak backtest with risk knobs
+# -------------------------
+@dataclass
+class BBreakParams:
+    n: int
+    k: float
+    h: int
+
+@dataclass
+class RiskParams:
+    commission: float = 0.0     # proportional commission per trade (e.g. 0.0005)
+    slippage_bps: float = 0.0   # basis points per trade (e.g. 2 bps => 0.0002)
+    delay_days: int = 0         # order execution delay (days)
+    max_position: float = 1.0   # cap position, here pos in {0,1}, cap must be >=1.0 to allow full
+    max_daily_turnover: float = 1.0 # with 0/1 positions, turnover/day <=1 anyway
+    min_trades: int = 0
+    min_exposure: float = 0.0   # fraction [0,1]
+
+def compute_bbands(close: pd.Series, n: int, k: float) -> Tuple[pd.Series, pd.Series, pd.Series]:
+    ma = close.rolling(n, min_periods=n).mean()
+    sd = close.rolling(n, min_periods=n).std(ddof=0)
+    upper = ma + k * sd
+    lower = ma - k * sd
+    return ma, upper, lower
+
+def backtest_bbreak(
+    df: pd.DataFrame,
+    p: BBreakParams,
+    r: RiskParams
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.Series, Dict[str, float]]:
+    """
+    Returns: trades_df, positions_df, equity_series, metrics
+    trades: [timestamp, side, price, size, reason]
+    positions: [timestamp, position, price, equity]
+    equity starts at 1.0
+    """
+    px = df["Close"].astype(float).copy()
+    ma, up, lo = compute_bbands(px, p.n, p.k)
+
+    # signals (pre-delay)
+    buy_sig  = (px > up)
+    sell_sig = (px < ma)  # exit rule after min-hold
+
+    # apply delay
+    if r.delay_days > 0:
+        buy_sig = buy_sig.shift(r.delay_days)
+        sell_sig = sell_sig.shift(r.delay_days)
+
+    pos = 0
+    last_buy_idx = None
+    equity = []
+    positions = []
+    trades = []
+    cash = 1.0
+    units = 0.0  # with 0/1 pos we use "one unit = all-in", keep simple
+    prev_price = None
+
+    # helper for cost/slippage on trade price
+    def exec_price(side: str, price: float) -> float:
+        slip = price * (r.slippage_bps * 1e-4)
+        if side == "BUY":
+            ex = price + slip
+        else:
+            ex = price - slip
+        return ex
+
+    # We'll track daily returns via equity series; when in pos=1, daily PnL follows price ratio
+    # with commissions at trade times.
+    # Here we simulate discrete trades with full notional.
+    for i, (dt, price) in enumerate(px.items()):
+        # carry equity mark-to-market
+        if prev_price is None:
+            eq = 1.0
+        else:
+            if pos == 1:
+                eq = equity[-1] * (price / prev_price)
+            else:
+                eq = equity[-1]
+        # check turnover cap: with 0/1 it's naturally okay; record later
+        reason = None
+        # enter
+        if pos == 0 and buy_sig.iloc[i] and not np.isnan(buy_sig.iloc[i]):
+            # open long
+            ex = exec_price("BUY", price)
+            # apply commission
+            eq *= (1.0 - r.commission)
+            pos = 1
+            last_buy_idx = i
+            reason = "break_up"
+            trades.append({"timestamp": dt, "side":"BUY","price": float(ex),"size":1,"reason":reason})
+            # Mark equity after commission (we don't change notional units in this simple model)
+            eq = eq  # already applied commission
+        # exit
+        elif pos == 1:
+            can_exit = True
+            if last_buy_idx is not None and (i - last_buy_idx) < p.h:
+                can_exit = False
+            if can_exit and sell_sig.iloc[i] and not np.isnan(sell_sig.iloc[i]):
+                ex = exec_price("SELL", price)
+                eq *= (1.0 - r.commission)
+                pos = 0
+                reason = "below_ma"
+                trades.append({"timestamp": dt,"side":"SELL","price": float(ex),"size":1,"reason":reason})
+        equity.append(eq)
+        positions.append({"timestamp": dt, "position": pos, "price": float(price), "equity": float(eq)})
+        prev_price = price
+
+    equity = pd.Series(equity, index=px.index, name="equity")
+    positions_df = pd.DataFrame(positions)
+    trades_df = pd.DataFrame(trades)
+
+    # metrics
+    daily_ret = equity.pct_change().fillna(0.0)
+    total_ret = equity.iloc[-1] / equity.iloc[0] - 1.0 if len(equity)>1 else 0.0
+    sharpe = 0.0
+    if daily_ret.std(ddof=0) > 1e-12:
+        sharpe = (daily_ret.mean() / daily_ret.std(ddof=0)) * np.sqrt(252.0)
+    # drawdown
+    roll_max = equity.cummax()
+    dd = equity/roll_max - 1.0
+    mdd = dd.min() if len(dd)>0 else 0.0
+    # exposure
+    exposure = positions_df["position"].mean() if len(positions_df)>0 else 0.0
+    # turnover proxy (changes in position)
+    if len(positions_df)>1:
+        pos_change = positions_df["position"].diff().abs().fillna(0.0)
+        ts = pd.to_datetime(positions_df["timestamp"], errors="coerce"); pos_change = positions_df["position"].diff().abs().fillna(0.0); daily_turnover = pos_change.groupby(ts.dt.normalize()).sum().mean(); daily_turnover = 0.0 if pd.isna(daily_turnover) else daily_turnover
+        # since pos in {0,1}, daily_turnover<=1 usually
+    else:
+        daily_turnover = 0.0
+    # cost ratio approx = total trade count * (commission + slippage_bp) / period_len
+    trades_count = len(trades_df)
+    cost_ratio = trades_count * (r.commission + r.slippage_bps * 1e-4)
+    metrics = {
+        "return": float(total_ret),
+        "sharpe": float(sharpe),
+        "mdd": float(mdd),
+        "trades": int(trades_count),
+        "exposure": float(exposure),
+        "turnover": float(daily_turnover),
+        "cost_ratio": float(cost_ratio),
+    }
+    return trades_df, positions_df, equity, metrics
+
+def fitness_from_metrics(m: Dict[str, float], alpha: float, beta: float, gamma: float, delta: float, zeta: float) -> float:
+    # Return is plain return %, Sharpe as is, MDD negative number (e.g. -0.12)
+    # We want penalty by |MDD|, so use -gamma * abs(mdd)
+    return (alpha * m["sharpe"] + beta * (m["return"] * 100.0)  # scale return to %
+            - gamma * abs(m["mdd"]) * 100.0
+            - delta * (m.get("turnover", 0.0) * 100.0)
+            - zeta  * (m.get("cost_ratio", 0.0) * 100.0))
+
+# -------------------------
+# Evolution
+# -------------------------
+def sample_params(rng: random.Random) -> BBreakParams:
+    n = rng.randint(5, 40)
+    k = round(rng.uniform(0.5, 1.8), 2)
+    h = rng.randint(2, 10)
+    return BBreakParams(n=n, k=k, h=h)
+
+def mutate_params(base: BBreakParams, rng: random.Random) -> BBreakParams:
+    n = max(3, int(round(base.n + rng.gauss(0, 5))))
+    k = round(max(0.4, base.k + rng.gauss(0, 0.2)), 2)
+    h = max(1, int(round(base.h + rng.gauss(0, 2))))
+    n = min(80, n)
+    k = min(3.0, k)
+    h = min(20, h)
+    return BBreakParams(n=n, k=k, h=h)
+
+def make_name(p: BBreakParams) -> str:
+    return f"BBreak_n{p.n}_k{p.k}_h{p.h}"
+
+def eval_candidate(df_train: pd.DataFrame, df_test: pd.DataFrame, p: BBreakParams,
+                   rp: RiskParams, alpha: float, beta: float, gamma: float, delta: float, zeta: float):
+    # train
+    tr_tr, tr_pos, tr_eq, tr_m = backtest_bbreak(df_train, p, rp)
+    # test
+    te_tr, te_pos, te_eq, te_m = backtest_bbreak(df_test, p, rp)
+    # constraints on test为主
+    feasible = True
+    if rp.min_trades > 0 and te_m["trades"] < rp.min_trades:
+        feasible = False
+    if rp.min_exposure > 0 and te_m["exposure"] < rp.min_exposure:
+        feasible = False
+    name = make_name(p)
+    fit_train = fitness_from_metrics(tr_m, alpha, beta, gamma, delta, zeta)
+    fit_test  = fitness_from_metrics(te_m, alpha, beta, gamma, delta, zeta)
+    fitness = 0.8 * fit_test + 0.2 * fit_train if feasible else -1e9
+    row = {
+        "name": name,
+        "family": "BBreak",
+        "params": json.dumps({"n": p.n, "k": p.k, "h": p.h}),
+        "trainReturn": tr_m["return"],
+        "trainSharpe": tr_m["sharpe"],
+        "trainMDD": tr_m["mdd"],
+        "trainTrades": tr_m["trades"],
+        "trainExposure": tr_m["exposure"],
+        "testReturn": te_m["return"],
+        "testSharpe": te_m["sharpe"],
+        "testMDD": te_m["mdd"],
+        "testTrades": te_m["trades"],
+        "testExposure": te_m["exposure"],
+        "fitness": fitness,
+        "feasible": int(feasible),
+    }
+    return row
+
+# -------------------------
+# Main
+# -------------------------
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--model-dir", required=True)
+    ap.add_argument("--symbol", default="SPY")
+    ap.add_argument("--csv", required=True)
+    ap.add_argument("--train_start", required=True)
+    ap.add_argument("--train_end", required=True)
+    ap.add_argument("--test_start", required=True)
+    ap.add_argument("--test_end", required=True)
+    ap.add_argument("--population", type=int, default=56)
+    ap.add_argument("--generations", type=int, default=3)
+    ap.add_argument("--topk", type=int, default=8)
+    ap.add_argument("--commission", type=float, default=0.0005)
+    ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--outdir", required=True)
+    ap.add_argument("--use-llm", dest="use_llm", action="store_true", help="只作为标记，不依赖外部包")
+    # 风控与适应度
+    ap.add_argument("--slippage-bps", type=float, default=0.0)
+    ap.add_argument("--delay-days", type=int, default=0)
+    ap.add_argument("--max-position", type=float, default=1.0)
+    ap.add_argument("--max-daily-turnover", type=float, default=1.0)
+    ap.add_argument("--min-trades", type=int, default=0)
+    ap.add_argument("--min-exposure", type=float, default=0.0)
+    ap.add_argument("--alpha", type=float, default=1.0)
+    ap.add_argument("--beta", type=float, default=0.5)
+    ap.add_argument("--gamma", type=float, default=1.0)
+    ap.add_argument("--delta", type=float, default=0.0)
+    ap.add_argument("--zeta", type=float, default=0.0)
+    args = ap.parse_args()
+
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+
+    ensure_outdir(args.outdir)
+
+    df_all = robust_read_csv(args.csv)
+    df_train = slice_by_date(df_all, args.train_start, args.train_end)
+    df_test  = slice_by_date(df_all, args.test_start, args.test_end)
+    if len(df_train)==0 or len(df_test)==0:
+        raise ValueError("train/test 时间段无数据")
+
+    rp = RiskParams(
+        commission=args.commission,
+        slippage_bps=args.slippage_bps,
+        delay_days=args.delay_days,
+        max_position=args.max_position,
+        max_daily_turnover=args.max_daily_turnover,
+        min_trades=args.min_trades,
+        min_exposure=args.min_exposure
+    )
+
+    alpha, beta, gamma, delta, zeta = args.alpha, args.beta, args.gamma, args.delta, args.zeta
+
+    # -------- generation loop ----------
+    rng = random.Random(args.seed)
+    pop: List[BBreakParams] = []
+    for _ in range(args.population):
+        pop.append(sample_params(rng))
+
+    best_row = None
+
+    for g in range(1, args.generations+1):
+        rows = []
+        # seeds or elites mutated
+        if g > 1 and best_row is not None:
+            # start from previous topk params mutated
+            # reconstruct params from previous gen CSV
+            prev_csv = os.path.join(args.outdir, f"gen{g-1:02d}.csv")
+            if os.path.isfile(prev_csv):
+                prev = pd.read_csv(prev_csv)
+                prev = prev.sort_values("fitness", ascending=False)
+                seeds = []
+                for _, r in prev.head(min(args.topk, len(prev))).iterrows():
+                    j = json.loads(r["params"])
+                    seeds.append(BBreakParams(n=int(j["n"]), k=float(j["k"]), h=int(j["h"])))
+                # mutate seeds to fill population
+                new_pop = []
+                while len(new_pop) < args.population:
+                    base = rng.choice(seeds)
+                    new_pop.append(mutate_params(base, rng))
+                pop = new_pop
+            else:
+                # fallback
+                pop = [mutate_params(pop[rng.randrange(len(pop))], rng) for _ in range(args.population)]
+        # evaluate
+        for idx, p in enumerate(pop, 1):
+            row = eval_candidate(df_train, df_test, p, rp, alpha, beta, gamma, delta, zeta)
+            rows.append(row)
+        gen_df = pd.DataFrame(rows)
+        gen_path = os.path.join(args.outdir, f"gen{g:02d}.csv")
+        gen_df.to_csv(gen_path, index=False)
+        log(f"[INFO] gen{g:02d} -> {gen_path}")
+        # update best
+        if len(gen_df) > 0:
+            rbest = gen_df.iloc[gen_df["fitness"].argmax()]
+            if (best_row is None) or (rbest["fitness"] > best_row["fitness"]):
+                best_row = rbest
+
+    if best_row is not None:
+        name = best_row["name"]
+        log(f"[BEST] name={name} fitness={best_row['fitness']:.4f} "
+            f"trainR={best_row['trainReturn']*100:.2f}% testR={best_row['testReturn']*100:.2f}% "
+            f"trainSharpe={best_row['trainSharpe']:.2f} testSharpe={best_row['testSharpe']:.2f}")
+    log(f"[INFO] all generations done -> {args.outdir}")
+
+if __name__ == "__main__":
+    main()
