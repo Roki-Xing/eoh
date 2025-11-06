@@ -1,0 +1,28 @@
+[INFO] gen05.csv -> /root/autodl-tmp/outputs/multi_mix/SPY/gen05.csv
+[INFO] best from gen -> BBreak_n34_k0.6_h1 (family=BBreak, params={'n': 34, 'k': 0.6, 'h': 1})
+[INFO] data loaded: train=756 rows, test=250 rows
+--------------------------------------------------
+[DEBUG] Backtest BBreak n=34, k=0.6, hold=1, commission=0.0005
+[INFO] saved -> /root/autodl-tmp/outputs/multi_mix/SPY/best_trades_train.csv (rows=42)
+[INFO] saved -> /root/autodl-tmp/outputs/multi_mix/SPY/best_positions_train.csv (rows=756)
+[INFO] saved -> /root/autodl-tmp/outputs/multi_mix/SPY/best_equity_train.csv (rows=756)
+[INFO] yearly report -> /root/autodl-tmp/outputs/multi_mix/SPY/yearly_report_train.csv
+[INFO] plot saved -> /root/autodl-tmp/outputs/multi_mix/SPY/best_plot_train.png
+[INFO] html saved -> /root/autodl-tmp/outputs/multi_mix/SPY/best_plot_train.html
+[INFO] saved -> /root/autodl-tmp/outputs/multi_mix/SPY/best_trades_test.csv (rows=11)
+[INFO] saved -> /root/autodl-tmp/outputs/multi_mix/SPY/best_positions_test.csv (rows=250)
+[INFO] saved -> /root/autodl-tmp/outputs/multi_mix/SPY/best_equity_test.csv (rows=250)
+[INFO] yearly report -> /root/autodl-tmp/outputs/multi_mix/SPY/yearly_report_test.csv
+[INFO] plot saved -> /root/autodl-tmp/outputs/multi_mix/SPY/best_plot_test.png
+[INFO] html saved -> /root/autodl-tmp/outputs/multi_mix/SPY/best_plot_test.html
+[INFO] side-by-side plot saved -> /root/autodl-tmp/outputs/multi_mix/SPY/best_plot_side_by_side.png
+[INFO] run_params.json saved -> /root/autodl-tmp/outputs/multi_mix/SPY/run_params.json
+/root/miniconda3/envs/eoh1/lib/python3.11/site-packages/transformers/utils/hub.py:110: FutureWarning:
+
+Using `TRANSFORMERS_CACHE` is deprecated and will be removed in v5 of Transformers. Use `HF_HOME` instead.
+
+[INFO] env_summary.txt saved -> /root/autodl-tmp/outputs/multi_mix/SPY/env_summary.txt
+[INFO] best_strategy.py saved -> /root/autodl-tmp/outputs/multi_mix/SPY/best_strategy.py
+[INFO] report appended -> /root/autodl-tmp/outputs/multi_mix/SPY/REPORT.md
+[INFO] report appended -> /root/autodl-tmp/outputs/multi_mix/SPY/REPORT.md
+[INFO] All done for best 'BBreak_n34_k0.6_h1'.

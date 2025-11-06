@@ -1,0 +1,32 @@
+{
+  "symbol": "QQQ",
+  "csv": "/root/autodl-tmp/price_cache/QQQ_2020_2023.csv",
+  "train_start": "2020-01-01",
+  "train_end": "2022-12-31",
+  "test_start": "2023-01-01",
+  "test_end": "2023-12-29",
+  "commission": 0.0005,
+  "population": 56,
+  "generations": 5,
+  "topk": 8,
+  "seed": 42,
+  "model_dir": "/root/autodl-tmp/models/Qwen2.5-7B-Instruct",
+  "family": "BBreak",
+  "best_name": "BBreak_n13_k1.45_h6",
+  "params": {
+    "n": 13,
+    "k": 1.45,
+    "h": 6
+  },
+  "slippage_bps": 2.0,
+  "delay_days": 1,
+  "max_position": 1.0,
+  "max_daily_turnover": 1.0,
+  "min_trades": 8,
+  "min_exposure": 0.5,
+  "alpha": 1.0,
+  "beta": 0.5,
+  "gamma": 1.0,
+  "delta": 0.2,
+  "zeta": 0.5
+}

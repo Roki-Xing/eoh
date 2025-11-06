@@ -1,0 +1,7 @@
+[INFO] gen01 -> /root/autodl-tmp/outputs/multi_mix/QQQ/gen01.csv
+[INFO] gen02 -> /root/autodl-tmp/outputs/multi_mix/QQQ/gen02.csv
+[INFO] gen03 -> /root/autodl-tmp/outputs/multi_mix/QQQ/gen03.csv
+[INFO] gen04 -> /root/autodl-tmp/outputs/multi_mix/QQQ/gen04.csv
+[INFO] gen05 -> /root/autodl-tmp/outputs/multi_mix/QQQ/gen05.csv
+[BEST] name=BBreak_n13_k1.42_h6 fitness=9.0253 trainR=13.91% testR=36.34% trainSharpe=0.36 testSharpe=2.55
+[INFO] all generations done -> /root/autodl-tmp/outputs/multi_mix/QQQ
