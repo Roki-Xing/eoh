@@ -1,0 +1,5 @@
+id,origin,fitness,train_Return_%,train_Sharpe,train_MaxDD_%,test_Return_%,test_Sharpe,test_MaxDD_%,code_path
+1,seed,1.07,-0.029003982500013077,-0.2388456011468606,-0.08489048294373358,0.03884069000001182,1.132451577317663,-0.03905643848998164,/root/autodl-tmp/outputs/eoh_smoke_fix2/gen01_codes/strat_001_seed.py
+4,seed,1.07,-0.029003982500013077,-0.2388456011468606,-0.08489048294373358,0.03884069000001182,1.132451577317663,-0.03905643848998164,/root/autodl-tmp/outputs/eoh_smoke_fix2/gen01_codes/strat_004_seed.py
+6,seed,,0.0,,-0.0,0.0,,-0.0,/root/autodl-tmp/outputs/eoh_smoke_fix2/gen01_codes/strat_006_seed.py
+7,seed,,0.0,,-0.0,0.0,,-0.0,/root/autodl-tmp/outputs/eoh_smoke_fix2/gen01_codes/strat_007_seed.py

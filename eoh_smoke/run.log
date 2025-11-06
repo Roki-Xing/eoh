@@ -1,0 +1,21 @@
+[INFO] local CSV hit: /root/autodl-tmp/price_cache/SPY_2020_2023.csv rows=505
+[INFO] split: train=377 test=128
+[INFO] model loaded on cuda:0
+[GEN] 1/8
+[OK] id=1 origin=seed fit=34.26 trainR=24.84 testR=4.75
+[GEN] 2/8
+[OK] id=2 origin=seed fit=6.26 trainR=4.93 testR=3.37
+[GEN] 3/8
+[OK] id=3 origin=seed fit=9.26 trainR=6.14 testR=-1.78
+[GEN] 4/8
+[OK] id=4 origin=seed fit=34.26 trainR=24.84 testR=4.75
+[GEN] 5/8
+[OK] id=5 origin=seed fit=6.26 trainR=4.93 testR=3.37
+[GEN] 6/8
+[OK] id=6 origin=seed fit=9.26 trainR=6.14 testR=-1.78
+[GEN] 7/8
+[OK] id=7 origin=seed fit=34.26 trainR=24.84 testR=4.75
+[GEN] 8/8
+[OK] id=8 origin=seed fit=6.26 trainR=4.93 testR=3.37
+[INFO] generation 1 done, valid=8; best fitness=34.26
+[INFO] results -> /root/autodl-tmp/outputs/eoh_smoke

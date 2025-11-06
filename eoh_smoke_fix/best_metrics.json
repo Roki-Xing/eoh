@@ -1,0 +1,12 @@
+{
+  "id": 1,
+  "origin": "seed",
+  "fitness": 24.744217381776934,
+  "train_Return_%": 20.31041668000004,
+  "train_Sharpe": 0.44338007017768977,
+  "train_MaxDD_%": -16.188995546349872,
+  "test_Return_%": 13.235552725000016,
+  "test_Sharpe": 1.5283201568507963,
+  "test_MaxDD_%": -5.6552379129929715,
+  "code_path": "/root/autodl-tmp/outputs/eoh_smoke_fix/gen01_codes/strat_001_seed.py"
+}

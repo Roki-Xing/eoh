@@ -1,0 +1,9 @@
+id,valid,code_len,ret_train,sharpe_train,maxdd_train,turnover_train,ret_test,sharpe_test,maxdd_test,turnover_test,fitness
+gen01_cand000,0,395,0,0,0,0,0,0,0,0,-999.0
+gen01_cand001,0,395,0,0,0,0,0,0,0,0,-999.0
+gen01_cand002,0,390,0,0,0,0,0,0,0,0,-999.0
+gen01_cand003,0,390,0,0,0,0,0,0,0,0,-999.0
+gen01_cand004,0,390,0,0,0,0,0,0,0,0,-999.0
+gen01_cand005,0,395,0,0,0,0,0,0,0,0,-999.0
+gen01_cand006,0,397,0,0,0,0,0,0,0,0,-999.0
+gen01_cand007,0,390,0,0,0,0,0,0,0,0,-999.0
