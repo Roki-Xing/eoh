@@ -1,0 +1,34 @@
+[
+  {
+    "id": 29,
+    "origin": "seed",
+    "program": "{\"type\":\"BBreak\",\"n\":30,\"k\":1.25,\"h\":4}",
+    "ok": true,
+    "name": "BBreak_n30_k1.25_h4",
+    "fitness": -2.339683752196876,
+    "trainR": 0.10241701339055576,
+    "trainSharpe": 0.33509039381071243,
+    "trainMDD": -0.10801513597420909,
+    "testR": 0.07321664067830613,
+    "testSharpe": 1.0051870328835897,
+    "testMDD": -0.07908411606857313,
+    "elapsed_sec": 0.072,
+    "error": null
+  },
+  {
+    "id": 47,
+    "origin": "seed",
+    "program": "{\"type\":\"BBreak\",\"n\":5,\"k\":0.60,\"h\":1}",
+    "ok": true,
+    "name": "BBreak_n5_k0.6_h1",
+    "fitness": -7.908399580692789,
+    "trainR": -0.19748572108385798,
+    "trainSharpe": -0.45374182201747393,
+    "trainMDD": -0.29621145313617403,
+    "testR": 0.03061464475647324,
+    "testSharpe": 0.3880259601085398,
+    "testMDD": -0.07928621671500946,
+    "elapsed_sec": 0.082,
+    "error": null
+  }
+]

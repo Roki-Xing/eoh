@@ -1,0 +1,12 @@
+timestamp,side,price,size,reason
+2023-02-13,BUY,412.83,1,break_up
+2023-02-22,SELL,398.54,1,below_ma
+2023-03-29,BUY,401.35,1,break_up
+2023-04-26,SELL,404.36,1,below_ma
+2023-04-28,BUY,415.93,1,break_up
+2023-05-16,SELL,410.25,1,below_ma
+2023-05-17,BUY,415.23,1,break_up
+2023-08-04,SELL,446.81,1,below_ma
+2023-09-14,BUY,450.36,1,break_up
+2023-09-22,SELL,430.42,1,below_ma
+2023-11-03,BUY,434.69,1,break_up

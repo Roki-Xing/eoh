@@ -1,0 +1,14 @@
+{
+  "name": "BBreak_n8_k0.99_h9",
+  "fitness": 5.333755087303473,
+  "train_ret": 3.8465423684851903,
+  "train_sharpe": 4.400451451071559,
+  "train_mdd": -0.02978560490045956,
+  "train_trades": 120,
+  "train_expo": 0.4656084656084656,
+  "test_ret": 0.5071140015435966,
+  "test_sharpe": 5.531443158221419,
+  "test_mdd": -0.012739697243560832,
+  "test_trades": 45,
+  "test_expo": 0.48
+}

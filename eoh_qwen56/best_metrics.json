@@ -1,0 +1,12 @@
+{
+  "id": 1,
+  "origin": "seed",
+  "fitness": 24.741492576835427,
+  "train_Return_%": 20.31041668000004,
+  "train_Sharpe": 0.4431075896835386,
+  "train_MaxDD_%": -16.188995546349872,
+  "test_Return_%": 13.131688660000016,
+  "test_Sharpe": 1.5148195181437045,
+  "test_MaxDD_%": -5.6552379129929715,
+  "code_path": "/root/autodl-tmp/outputs/eoh_qwen56/gen01_codes/strat_001_seed.py"
+}
