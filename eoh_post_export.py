@@ -1,126 +1,32 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Export best strategy artifacts from last genXX.csv
-- 解析 best name（仅支持 BBreak_n{n}_k{k}_h{h}）
-- 回测(与 evolve 逻辑一致，支持佣金/滑点/延迟等快照但此脚本不强制重传风控参数)
-- 导出：best_trades_*.csv / best_positions_*.csv / best_equity_*.csv
-- 导出：yearly_report_{train,test}.csv（含 Buy&Hold 列：bh_return/bh_vol/bh_sharpe/bh_mdd）
-- 导出：best_plot_{train,test}.png、best_plot_side_by_side.png；可选 --html 输出交互式
-- REPORT.md：追加指标与参数快照；导出 best_strategy.py / run_params.json / env_summary.txt
+Export best strategy artifacts from the latest generation CSV.
 """
-import os, re, sys, json, math, argparse, warnings, platform, subprocess
-from typing import Tuple, Dict, Any, List
-import numpy as np
-import pandas as pd
+import argparse
+import json
+import os
+import platform
+import re
+import sys
+from typing import Any, Dict, List, Tuple
+
 import matplotlib
+
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
 
-# -------------------------
-# IO & Utils
-# -------------------------
-def log(msg: str):
-    print(msg, flush=True)
-
-def ensure_outdir(d: str):
-    os.makedirs(d, exist_ok=True)
-
-def robust_read_csv(csv_path: str) -> pd.DataFrame:
-    if not os.path.isfile(csv_path):
-        raise FileNotFoundError(csv_path)
-    df = pd.read_csv(csv_path)
-    time_cols = [c for c in df.columns if str(c).lower() in ("date","datetime","timestamp","time")]
-    if not time_cols:
-        if "Date" in df.columns:
-            time_col = "Date"
-        else:
-            time_col = df.columns[0]
-        df[time_col] = pd.to_datetime(df[time_col], errors="coerce", utc=False)
-        df = df[~df[time_col].isna()].copy().set_index(time_col)
-    else:
-        time_col = time_cols[0]
-        df[time_col] = pd.to_datetime(df[time_col], errors="coerce", utc=False)
-        df = df[~df[time_col].isna()].copy().set_index(time_col)
-    # unify
-    pick = None
-    for cand in ("Adj Close","adj close","adj_close","Close","close","price"):
-        if cand in df.columns:
-            pick = cand
-            break
-    if pick is None:
-        raise ValueError("CSV缺少收盘价列(如 Close/Adj Close)")
-    df["Close"] = df[pick].astype(float)
-    return df.sort_index()
-
-def slice_by_date(df: pd.DataFrame, start: str, end: str) -> pd.DataFrame:
-    s = pd.Timestamp(start)
-    e = pd.Timestamp(end)
-    return df[(df.index >= s) & (df.index <= e)].copy()
-
-# -------------------------
-# Strategy (BBreak) & backtest
-# -------------------------
-def compute_bbands(close: pd.Series, n: int, k: float):
-    ma = close.rolling(n, min_periods=n).mean()
-    sd = close.rolling(n, min_periods=n).std(ddof=0)
-    up = ma + k*sd
-    lo = ma - k*sd
-    return ma, up, lo
-
-def backtest_bbreak(df: pd.DataFrame, n: int, k: float, hold: int, commission: float,
-                    slippage_bps: float=0.0, delay_days: int=0):
-    px = df["Close"].astype(float).copy()
-    ma, up, lo = compute_bbands(px, n, k)
-    buy_sig  = (px > up)
-    sell_sig = (px < ma)
-    if delay_days > 0:
-        buy_sig = buy_sig.shift(delay_days)
-        sell_sig = sell_sig.shift(delay_days)
-    pos = 0
-    last_buy_idx = None
-    equity = []
-    positions = []
-    trades = []
-    prev_price = None
-
-    def exec_price(side: str, price: float) -> float:
-        slip = price * (slippage_bps * 1e-4)
-        return price + slip if side=="BUY" else price - slip
-
-    for i,(dt, price) in enumerate(px.items()):
-        if prev_price is None:
-            eq = 1.0
-        else:
-            if pos==1:
-                eq = equity[-1] * (price / prev_price)
-            else:
-                eq = equity[-1]
-        # buy
-        if pos==0 and buy_sig.iloc[i] and not np.isnan(buy_sig.iloc[i]):
-            ex = exec_price("BUY", price)
-            eq *= (1.0 - commission)
-            pos = 1
-            last_buy_idx = i
-            trades.append({"timestamp": dt, "side": "BUY", "price": float(ex), "size": 1, "reason":"break_up"})
-        # sell
-        elif pos==1:
-            can_exit = True
-            if last_buy_idx is not None and (i - last_buy_idx) < hold:
-                can_exit = False
-            if can_exit and sell_sig.iloc[i] and not np.isnan(sell_sig.iloc[i]):
-                ex = exec_price("SELL", price)
-                eq *= (1.0 - commission)
-                pos = 0
-                trades.append({"timestamp": dt, "side": "SELL", "price": float(ex), "size": 1, "reason":"below_ma"})
-        equity.append(eq)
-        positions.append({"timestamp": dt, "position": pos, "price": float(price), "equity": float(eq)})
-        prev_price = price
-
-    eq = pd.Series(equity, index=px.index, name="equity")
-    pos_df = pd.DataFrame(positions)
-    tr_df = pd.DataFrame(trades)
-    return tr_df, pos_df, eq
+from eoh_core import (
+    BBreakParams,
+    RiskParams,
+    backtest_bbreak,
+    compute_bbands,
+    robust_read_csv,
+    slice_by_date,
+)
+from eoh_core.utils import ensure_dir, log
 
 def bh_equity_from_close(close: pd.Series) -> pd.Series:
     close = close.astype(float)
@@ -409,14 +315,30 @@ def snapshot_env(outdir: str):
         f.write("\n".join(lines))
     log(f"[INFO] env_summary.txt saved -> {p}")
 
-def append_report(outdir: str, side_name: str, family: str, params: Dict[str,Any],
-                  ypath: str, best_name: str, args: argparse.Namespace):
+def append_report(
+    outdir: str,
+    side_name: str,
+    family: str,
+    params: Dict[str, Any],
+    ypath: str,
+    best_name: str,
+    args: argparse.Namespace,
+    *,
+    metrics: Dict[str, float] | None = None,
+) -> None:
     report = os.path.join(outdir, "REPORT.md")
     # load yearly report sample lines
     df = pd.read_csv(ypath)
     lines = []
     lines.append(f"## {side_name.upper()} — {best_name}")
     lines.append(f"- Family: **{family}**, Params: `{json.dumps(params)}`")
+    if metrics:
+        lines.append(
+            "- Metrics: return={return:.2%}, sharpe={sharpe:.2f}, mdd={mdd:.2%}, "
+            "turnover={turnover:.2%}, exposure={exposure:.2%}, trades={trades:.0f}, cost={cost_ratio:.4f}".format(
+                **metrics
+            )
+        )
     if not df.empty:
         # show last row quickly
         tail = df.iloc[-1].to_dict()
@@ -481,7 +403,7 @@ def main():
     ap.add_argument("--zeta", type=float, default=0.0)
     args = ap.parse_args()
 
-    ensure_outdir(args.outdir)
+    ensure_dir(args.outdir)
     family, params, best_name = parse_best_from_gencsv(args.outdir)
     log(f"[INFO] best from gen -> {best_name} (family={family}, params={params})")
 
@@ -496,8 +418,16 @@ def main():
     # ---- RUN train
     log("--------------------------------------------------")
     log(f"[DEBUG] Backtest BBreak n={n}, k={k}, hold={h}, commission={args.commission}")
-    tr_trades, tr_pos, tr_eq = backtest_bbreak(df_train, n, k, h, args.commission)
-    # export tables
+    train_result = backtest_bbreak(df_train, strategy_params, risk)
+    tr_trades = train_result.trades
+    tr_pos = train_result.positions
+    tr_eq = train_result.equity
+    train_metrics = train_result.metrics.as_dict()
+    log(
+        "[TRAIN] return={return:.2%} sharpe={sharpe:.2f} mdd={mdd:.2%} trades={trades} cost={cost_ratio:.4f}".format(
+            **train_metrics
+        )
+    )
     export_table(tr_trades, os.path.join(args.outdir, "best_trades_train.csv"),
                  ["timestamp","side","price","size","reason"])
     export_table(tr_pos, os.path.join(args.outdir, "best_positions_train.csv"),
@@ -509,10 +439,7 @@ def main():
     })
     export_table(eq_train, os.path.join(args.outdir, "best_equity_train.csv"),
                  ["timestamp","equity","bh_equity"])
-    # yearly report with BH
     y_train = yearly_report(tr_eq, tr_trades, df_train["Close"])
-    # merge BH stats
-    # compute BH yearly
     bh = bh_equity_from_close(df_train["Close"])
     bh_rows=[]
     for y in sorted(set(df_train.index.year)):
@@ -528,7 +455,6 @@ def main():
     ypath = os.path.join(args.outdir, "yearly_report_train.csv")
     y_train.to_csv(ypath, index=False)
     log(f"[INFO] yearly report -> {ypath}")
-    # plots
     plot_price_bbands_trades(df_train, n,k, tr_trades, tr_pos,
                              os.path.join(args.outdir, "best_plot_train.png"),
                              f"[TRAIN] {best_name}")
@@ -538,7 +464,16 @@ def main():
                   f"[TRAIN] {best_name}")
 
     # ---- RUN test
-    tr_trades_t, tr_pos_t, tr_eq_t = backtest_bbreak(df_test, n, k, h, args.commission)
+    test_result = backtest_bbreak(df_test, strategy_params, risk)
+    tr_trades_t = test_result.trades
+    tr_pos_t = test_result.positions
+    tr_eq_t = test_result.equity
+    test_metrics = test_result.metrics.as_dict()
+    log(
+        "[TEST] return={return:.2%} sharpe={sharpe:.2f} mdd={mdd:.2%} trades={trades} cost={cost_ratio:.4f}".format(
+            **test_metrics
+        )
+    )
     export_table(tr_trades_t, os.path.join(args.outdir, "best_trades_test.csv"),
                  ["timestamp","side","price","size","reason"])
     export_table(tr_pos_t, os.path.join(args.outdir, "best_positions_test.csv"),
@@ -550,7 +485,6 @@ def main():
     })
     export_table(eq_test, os.path.join(args.outdir, "best_equity_test.csv"),
                  ["timestamp","equity","bh_equity"])
-    # yearly with BH
     y_test = yearly_report(tr_eq_t, tr_trades_t, df_test["Close"])
     bh = bh_equity_from_close(df_test["Close"])
     bh_rows=[]
@@ -586,8 +520,26 @@ def main():
     export_best_strategy_py(args.outdir, family, params)
 
     # report append
-    append_report(args.outdir, "train", family, params, os.path.join(args.outdir, "yearly_report_train.csv"), best_name, args)
-    append_report(args.outdir, "test", family, params, os.path.join(args.outdir, "yearly_report_test.csv"), best_name, args)
+    append_report(
+        args.outdir,
+        "train",
+        family,
+        params,
+        os.path.join(args.outdir, "yearly_report_train.csv"),
+        best_name,
+        args,
+        metrics=train_metrics,
+    )
+    append_report(
+        args.outdir,
+        "test",
+        family,
+        params,
+        os.path.join(args.outdir, "yearly_report_test.csv"),
+        best_name,
+        args,
+        metrics=test_metrics,
+    )
     log(f"[INFO] All done for best '{best_name}'.")
 
 if __name__ == "__main__":
